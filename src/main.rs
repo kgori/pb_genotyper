@@ -10,7 +10,7 @@ use std::path::PathBuf;
 mod cigar;
 mod regions;
 
-use cigar::{check_cigar_overlap, position_in_read, ReadPosition, insertion_at_position};
+use cigar::{check_cigar_overlap, get_read_position, ReadPosition, get_insertion_at_position};
 
 fn get_chrom_names(bamfile: &std::path::Path) -> Result<Vec<String>, Error> {
     let bam = Reader::from_path(bamfile)?;
@@ -26,14 +26,28 @@ fn get_chrom_names(bamfile: &std::path::Path) -> Result<Vec<String>, Error> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Variant {
     chrom: String,
-    pos: u32,
-    ref_base: char,
-    alt_base: char,
+    pos: i64,
+    ref_base: String,
+    alt_base: String,
     is_germline: bool,
     is_indel: bool,
+}
+
+impl Variant {
+    fn is_insertion(&self) -> bool {
+        self.ref_base.len() == 1 && self.alt_base.len() > 1 &&
+            self.is_indel &&
+            self.ref_base.as_bytes()[0] == self.alt_base.as_bytes()[0]
+    }
+
+    fn is_deletion(&self) -> bool {
+        self.ref_base.len() > 1 && self.alt_base.len() == 1 &&
+            self.is_indel &&
+            self.ref_base.as_bytes()[0] == self.alt_base.as_bytes()[0]
+    }
 }
 
 fn open_tsv(file_path: &str) -> Result<csv::Reader<File>, Error> {
@@ -45,6 +59,7 @@ fn open_tsv(file_path: &str) -> Result<csv::Reader<File>, Error> {
     Ok(reader)
 }
 
+// Loads variants from a TSV file. Variant positions are 1-based.
 fn load_variants(file_path: &str) -> Result<Vec<Variant>, Error> {
     let mut reader = open_tsv(file_path)?;
     reader.records().map(|record| {
@@ -58,8 +73,8 @@ fn load_variants(file_path: &str) -> Result<Vec<Variant>, Error> {
         Ok(Variant {
             chrom: chrom.to_string(),
             pos: pos.parse()?,
-            ref_base: ref_base.chars().next().ok_or_else(|| Error::msg("ref_base is empty"))?,
-            alt_base: alt_base.chars().next().ok_or_else(|| Error::msg("alt_base is empty"))?,
+            ref_base: ref_base.to_string(),
+            alt_base: alt_base.to_string(),
             is_germline: is_germline.to_lowercase().parse()?,
             is_indel: is_indel.to_lowercase().parse()?,
         })
@@ -69,11 +84,13 @@ fn load_variants(file_path: &str) -> Result<Vec<Variant>, Error> {
 #[derive(Debug, Clone)]
 struct Region {
     chrom: String,
-    start: u32,
-    end: u32,
+    start: i64,
+    end: i64,
     name: String,
 }
 
+// Loads regions from a TSV file. Region positions are 1-based, inclusive ranges,
+// meaning that both the start and end positions are included in the region.
 fn load_regions(file_path: &str) -> Result<Vec<Region>, Error> {
     let mut reader = open_tsv(file_path)?;
     reader.records().map(|record| {
@@ -107,6 +124,17 @@ fn fetch_bam_reads_from_region(bam: &mut IndexedReader, region: &Region) -> Resu
 }
 
 
+fn get_variants_from_region(variants: &Vec<Variant>, region: &Region) -> Vec<Variant> {
+    variants.iter()
+        .filter(|v| v.chrom == region.chrom && v.pos >= region.start && v.pos <= region.end).cloned().collect()
+}
+
+fn read_overlaps_region(record: &Record, region: &Region) -> bool {
+    let overlap = check_cigar_overlap(record, (region.start - 1).into(), region.end.into());
+    overlap
+}
+
+
 fn main() -> Result<(), Error> {
     let variants_path = "/lustre/scratch126/casm/team267ms/kg8/projects/pacbio/code/pb_explore/data/variants.tsv";
     let variants = load_variants(variants_path)?;
@@ -117,50 +145,136 @@ fn main() -> Result<(), Error> {
     regions.sort_by(|a, b| a.name.cmp(&b.name));
     println!("{:?}", regions[0]);
 
-    let my_region = get_region_with_name(&regions, "C").unwrap();
+    let my_region = get_region_with_name(&regions, "F").unwrap();
+
+    let my_variants = get_variants_from_region(&variants, &my_region);
+    println!("{:?}", my_variants[0]);
 
     let bam_path = "/lustre/scratch126/casm/team267ms/kg8/projects/pacbio/alignments/2169Tb.1.hifi_reads.aligned.bam";
     let mut bam = IndexedReader::from_path(bam_path).unwrap();
     let mut record = Record::new();
 
-    let chrnames = get_chrom_names(std::path::Path::new(bam_path)).unwrap();
-    
-    // let f = bam.fetch(("21", 28669568, 28771175));
-    // let f = bam.fetch(("1", 30237476, 33634687));
-    let f = fetch_bam_reads_from_region(&mut bam, &my_region)?;
-    println!("{:?}", f);
+    fetch_bam_reads_from_region(&mut bam, &my_region)?;
 
     while let Some(result) = bam.read(&mut record) {
-        // let record = result.unwrap();
-        let qname = String::from_utf8(record.qname().to_vec()).unwrap();
-        if qname == "m84093_240411_112803_s2/111285790/ccs" {
-            println!("record = {:?}", record);
-            println!("record.qname = {:?}", qname);
-            println!("{}", String::from_utf8(record.seq().as_bytes().to_vec()).unwrap());
+        if record.qname() == b"m84093_240411_112803_s2/223871912/ccs" {
             break;
         }
     }
+    
     println!("record = {:?}", record);
     println!("record.qname = {:?}", String::from_utf8(record.qname().to_vec()));
-    println!("is supplementary? = {:?}", record.is_supplementary());
-    println!("cigar = {:?}", record.cigar());
-    println!("cigar string = {:?}", record.cigar().to_string());
     println!("pos = {:?}", record.pos());
+    println!("is supplementary? = {:?}", record.is_supplementary());
 
-    let overlap = check_cigar_overlap(&record, 30237476, 33634687);
-    println!("overlap segment C = {:?}", overlap);
-    let overlap = check_cigar_overlap(&record, 28669568, 28771175);
-    println!("overlap segment D = {:?}", overlap);
-
-    for refpos in 30243800..30243880 {
-        let ins_found = insertion_at_position(&record, refpos);
-        match ins_found {
-            Some(ins) => {
-                let seq = String::from_utf8(ins.seq.to_vec()).unwrap();
-                println!("ins_found = {:?}, {:?}", ins, seq);
-            },
-            None => {}
+    assert!(read_overlaps_region(&record, &my_region));
+    for var in &my_variants {
+        if var.pos >= record.pos() && var.pos <= (record.pos() + record.seq_len() as i64) {
+            let result = genotype_variant(&record, var);
+            println!("variant = {:?}", var);
+            println!("result = {:?}", result);
         }
     }
     Ok(())
+}
+
+#[derive(Debug)]
+enum GenotypeResult {
+    Reference(String),
+    Alternative(String),
+    ThirdAllele(String),
+    OutOfRange,
+    Deleted,
+}
+
+fn genotype_insertion(record: &Record, variant: &Variant) -> Result<GenotypeResult, Error> {
+    let insertion = get_insertion_at_position(record, (variant.pos - 1).into());
+    match insertion {
+        Some(insertion) => {
+            let seq = String::from_utf8(insertion.seq.clone())?;
+            if seq == variant.alt_base {
+                Ok(GenotypeResult::Alternative(seq))
+            }
+            else {
+                Ok(GenotypeResult::ThirdAllele(seq))
+            }
+        },
+        None => Ok(GenotypeResult::Reference(variant.ref_base.clone())),
+    }
+}
+
+fn genotype_snp(record: &Record, variant: &Variant) -> Result<GenotypeResult, Error> {
+    let read_position = get_read_position(record, (variant.pos - 1).into());
+    let ref_base = variant.ref_base.chars().next().unwrap();
+    let alt_base = variant.alt_base.chars().next().unwrap();
+    match read_position {
+        ReadPosition::Match(i) => {
+            let base = record.seq()[i] as char;
+            if base == ref_base {
+                Ok(GenotypeResult::Reference(base.to_string()))
+            }
+            else if base == alt_base {
+                Ok(GenotypeResult::Alternative(base.to_string()))
+            }
+            else {
+                Ok(GenotypeResult::ThirdAllele(base.to_string()))
+            }
+        },
+        ReadPosition::Deletion => Ok(GenotypeResult::Deleted),
+        ReadPosition::NotOverlapped => Ok(GenotypeResult::OutOfRange),
+    }
+}
+
+fn genotype_deletion(record: &Record, variant: &Variant) -> Result<GenotypeResult, Error> {
+    let pos = (variant.pos - 1) as i64;
+    // First check that the first base of the deletion is present in the read
+    let read_position = get_read_position(record, pos);
+    match read_position {
+        ReadPosition::Match(i) => {
+            let base = record.seq()[i] as char;
+            if base != variant.ref_base.chars().next().unwrap() {
+                return Err(Error::msg("Read is ambiguous at first position of deletion"));
+            }
+        },
+        _ => return Err(Error::msg("First base of indel not found in read")),
+    };
+
+    // Then check the next n bases are deleted
+    let deletion_size = variant.ref_base.len() - variant.alt_base.len();
+    let mut deletions_found = 0;
+    for i in 1..=deletion_size {
+        let i: i64 = i as i64;
+        let read_position = get_read_position(record, pos + i);
+        match read_position {
+            ReadPosition::Deletion => deletions_found += 1,
+            ReadPosition::Match(_) => {},
+            _ => return Err(Error::msg("Read is ambiguous at deletion position")),
+        }
+    }
+    if deletions_found == deletion_size {
+        Ok(GenotypeResult::Alternative(variant.alt_base.clone()))
+    }
+    else {
+        Ok(GenotypeResult::Reference(variant.ref_base.clone()))
+    }
+}
+
+
+fn genotype_variant(record: &Record, variant: &Variant) -> Result<GenotypeResult, Error> {
+    if variant.pos <= record.pos() || variant.pos > (record.pos() + record.seq_len() as i64) {
+        return Ok(GenotypeResult::OutOfRange);
+    }
+    
+    if variant.is_indel {
+        if variant.is_insertion() {
+            return genotype_insertion(record, variant);
+        } else if variant.is_deletion() {
+            return genotype_deletion(record, variant);
+        } else {
+            return Err(Error::msg("Indels with multiple bases in both ref and alt are not supported"));
+        }
+    }
+    else {
+        return genotype_snp(record, variant);
+    }
 }

@@ -55,7 +55,7 @@ pub struct Insertion {
 
 // Function to find the position in the read that corresponds to a given reference position
 // returns None if the reference position is not covered by the read
-pub(crate) fn position_in_read(record: &Record, reference_position: i64) -> ReadPosition {
+pub(crate) fn get_read_position(record: &Record, reference_position: i64) -> ReadPosition {
     let mut curr_ref_pos = record.pos(); // Current reference position
     let mut curr_read_pos = 0; // Current position in the read
 
@@ -93,9 +93,10 @@ pub(crate) fn position_in_read(record: &Record, reference_position: i64) -> Read
     }
     ReadPosition::NotOverlapped // No overlap found
 }
+
 // Function to check if there is an insertion in the read relative to the reference at the position
 // immediately after the reference position
-pub(crate) fn insertion_at_position(record: &Record, reference_position: i64) -> Option<Insertion> {
+pub(crate) fn get_insertion_at_position(record: &Record, reference_position: i64) -> Option<Insertion> {
     let mut curr_ref_pos = record.pos(); // Current reference position
     let mut curr_read_pos = 0; // Current position in the read
     
