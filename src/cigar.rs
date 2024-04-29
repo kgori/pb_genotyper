@@ -40,9 +40,22 @@ pub(crate) fn check_cigar_overlap(record: &Record, interval_start: i64, interval
     false // No overlap found
 }
 
+pub enum ReadPosition {
+    Match(usize),
+    Deletion,
+    NotOverlapped,
+}
+
+#[derive(Debug)]
+pub struct Insertion {
+    pub ref_pos: usize,
+    pub read_pos: (usize, usize),
+    pub seq: Vec<u8>,
+}
+
 // Function to find the position in the read that corresponds to a given reference position
 // returns None if the reference position is not covered by the read
-pub(crate) fn position_in_read(record: &Record, reference_position: i64) -> Option<usize> {
+pub(crate) fn position_in_read(record: &Record, reference_position: i64) -> ReadPosition {
     let mut curr_ref_pos = record.pos(); // Current reference position
     let mut curr_read_pos = 0; // Current position in the read
 
@@ -54,7 +67,7 @@ pub(crate) fn position_in_read(record: &Record, reference_position: i64) -> Opti
                 if curr_ref_pos <= reference_position && curr_ref_pos + len > reference_position {
                     // There is an overlap
                     let offset = reference_position - curr_ref_pos;
-                    return Some((curr_read_pos + offset) as usize);
+                    return ReadPosition::Match((curr_read_pos + offset) as usize);
                 }
                 curr_ref_pos += len; // Move past this segment for the next CIGAR element
                 curr_read_pos += len;
@@ -64,15 +77,58 @@ pub(crate) fn position_in_read(record: &Record, reference_position: i64) -> Opti
             }
             'D' => { // Deletion
                 if curr_ref_pos <= reference_position && curr_ref_pos + len > reference_position {
-                    return None; // Reference position is in the deleted region
+                    return ReadPosition::Deletion; // Reference position is in the deleted region
                 }
                 curr_ref_pos += len;
             }
-            'I' | 'S' | 'H' | 'P' => { curr_read_pos += len } // Insertion to the reference, soft clipping, hard clipping, and padding (ignored for alignment)
+            'I' => { // Insertion
+                curr_read_pos += len;
+                // if curr_ref_pos <= reference_position && curr_ref_pos + len > reference_position {
+                //     return ReadPosition::Insertion(curr_read_pos as usize); // Insertion is not part of the reference
+                // }
+            }
+            'S' | 'H' | 'P' => { curr_read_pos += len } // Insertion to the reference, soft clipping, hard clipping, and padding (ignored for alignment)
             _ => {}
         }
     }
-    None // No overlap found
+    ReadPosition::NotOverlapped // No overlap found
+}
+// Function to check if there is an insertion in the read relative to the reference at the position
+// immediately after the reference position
+pub(crate) fn insertion_at_position(record: &Record, reference_position: i64) -> Option<Insertion> {
+    let mut curr_ref_pos = record.pos(); // Current reference position
+    let mut curr_read_pos = 0; // Current position in the read
+    
+    for cigar in record.cigar().iter() {
+        let len = cigar.len() as i64;
+        match cigar.char() {
+            'M' | '=' | 'X' => {
+                // Consider 'M', '=', and 'X' as alignment matches
+                curr_ref_pos += len; // Move past this segment for the next CIGAR element
+                curr_read_pos += len;
+            }
+            'N' => { // Refskip
+                curr_ref_pos += len;
+            }
+            'D' => { // Deletion
+                curr_ref_pos += len;
+            }
+            'I' => { // Insertion
+                if curr_ref_pos == reference_position + 1 {
+                    let ins = Insertion {
+                            ref_pos: reference_position as usize,
+                            read_pos: ((curr_read_pos - 1) as usize, (curr_read_pos + len) as usize),
+                            seq: record.seq().as_bytes()[(curr_read_pos - 1) as usize..(curr_read_pos + len) as usize].to_vec(),
+                    };
+                    return Some(ins); // Insertion found
+                }
+                curr_read_pos += len;
+            }
+            'S' | 'H' | 'P' => { curr_read_pos += len } // Soft clipping, hard clipping, and padding (ignored for alignment)
+            _ => {}
+        }
+    }
+    None // No insertion found
 }
 
 #[cfg(test)]

@@ -5,16 +5,12 @@
 use anyhow::Error;
 use rust_htslib::bam::{IndexedReader, Read, Reader, Record};
 use std::fs::File;
-use std::sync::Arc;
-use datafusion::prelude::*;
-use datafusion::datasource::listing;
-use datafusion::datasource::file_format::parquet;
-use datafusion::datasource::TableProvider;
+use std::path::PathBuf;
 
 mod cigar;
 mod regions;
 
-use cigar::{check_cigar_overlap, position_in_read};
+use cigar::{check_cigar_overlap, position_in_read, ReadPosition, insertion_at_position};
 
 fn get_chrom_names(bamfile: &std::path::Path) -> Result<Vec<String>, Error> {
     let bam = Reader::from_path(bamfile)?;
@@ -30,35 +26,98 @@ fn get_chrom_names(bamfile: &std::path::Path) -> Result<Vec<String>, Error> {
     }
 }
 
-use tokio;
-#[tokio::main]
-async fn main() -> Result<(), Error> {
-    let ctx = SessionContext::new();
-    let session_state = ctx.state();
-    let csv_path = "/nfs/users/nfs_k/kg8/lustre/projects/ctvt_horizontal_transfer/2024-01-19_CTVT_Nepal_samples/pacbio/code/pb_explore/data/ht_regions.tsv";
-    let csv_options = CsvReadOptions::new().delimiter(b'\t').has_header(true);
-    let csv_df = ctx.read_csv(csv_path, csv_options).await?;
+#[derive(Debug)]
+struct Variant {
+    chrom: String,
+    pos: u32,
+    ref_base: char,
+    alt_base: char,
+    is_germline: bool,
+    is_indel: bool,
+}
 
-    let arrow_path = "/nfs/users/nfs_k/kg8/lustre/projects/ctvt_horizontal_transfer/2024-01-19_CTVT_Nepal_samples/nf_postprocess_cnvs_and_snvs/runs/filtered_20240201/out/results/dataset";
-    let arrow_path =  listing::ListingTableUrl::parse(arrow_path)?;
-    let file_format = parquet::ParquetFormat::default();
-    let listing_options = listing::ListingOptions::new(Arc::new(file_format))
-        .with_file_extension(".parquet");
+fn open_tsv(file_path: &str) -> Result<csv::Reader<File>, Error> {
+    let file = File::open(file_path)?;
+    let reader = csv::ReaderBuilder::new()
+        .delimiter(b'\t')
+        .has_headers(true)
+        .from_reader(file);
+    Ok(reader)
+}
 
-    let resolved_schema = listing_options.infer_schema(&session_state, &arrow_path).await?;
-    let config = listing::ListingTableConfig::new(arrow_path)
-        .with_listing_options(listing_options)
-        .with_schema(resolved_schema);
-    let provider = Arc::new(listing::ListingTable::try_new(config)?);
+fn load_variants(file_path: &str) -> Result<Vec<Variant>, Error> {
+    let mut reader = open_tsv(file_path)?;
+    reader.records().map(|record| {
+        let record = record?;
+        let chrom = record.get(0).ok_or_else(|| Error::msg("missing chrom"))?;
+        let pos = record.get(1).ok_or_else(|| Error::msg("missing pos"))?;
+        let ref_base = record.get(2).ok_or_else(|| Error::msg("missing ref_base"))?;
+        let alt_base = record.get(3).ok_or_else(|| Error::msg("missing alt_base"))?;
+        let is_germline = record.get(4).ok_or_else(|| Error::msg("missing is_germline"))?;
+        let is_indel = record.get(5).ok_or_else(|| Error::msg("missing is_indel"))?;
+        Ok(Variant {
+            chrom: chrom.to_string(),
+            pos: pos.parse()?,
+            ref_base: ref_base.chars().next().ok_or_else(|| Error::msg("ref_base is empty"))?,
+            alt_base: alt_base.chars().next().ok_or_else(|| Error::msg("alt_base is empty"))?,
+            is_germline: is_germline.to_lowercase().parse()?,
+            is_indel: is_indel.to_lowercase().parse()?,
+        })
+    }).collect()
+}
 
-    let join_expr = col("CHROM").eq(col("CHROM"))
-        .and(col("POS").gt_eq(col("START")))
-        .and(col("POS").lt_eq(col("END")));
+#[derive(Debug, Clone)]
+struct Region {
+    chrom: String,
+    start: u32,
+    end: u32,
+    name: String,
+}
 
-// Apply join between provider and CSV DataFrame
-    let joined_df = ctx
-        .execute_physical_plan(provider)?
-        .join(&ctx.collect(csv_df)?, join_expr, JoinType::Inner)?;
+fn load_regions(file_path: &str) -> Result<Vec<Region>, Error> {
+    let mut reader = open_tsv(file_path)?;
+    reader.records().map(|record| {
+        let record = record?;
+        let chrom = record.get(0).ok_or_else(|| Error::msg("missing chrom"))?;
+        let start = record.get(1).ok_or_else(|| Error::msg("missing start"))?;
+        let end = record.get(2).ok_or_else(|| Error::msg("missing end"))?;
+        let name = record.get(3).ok_or_else(|| Error::msg("missing name"))?;
+        Ok(Region {
+            chrom: chrom.to_string(),
+            start: start.parse()?,
+            end: end.parse()?,
+            name: name.to_string(),
+        })
+    }).collect()
+}
+
+
+fn get_region_with_name(regions: &Vec<Region>, name: &str) -> Option<Region> {
+    let found = regions.iter().find(|r| r.name == name);
+    match found {
+        Some(region) => Some(region.clone()),
+        None => None,
+    }
+}
+
+
+fn fetch_bam_reads_from_region(bam: &mut IndexedReader, region: &Region) -> Result<(), Error> {
+    bam.fetch((region.chrom.as_str(), region.start, region.end))?;
+    Ok(())
+}
+
+
+fn main() -> Result<(), Error> {
+    let variants_path = "/lustre/scratch126/casm/team267ms/kg8/projects/pacbio/code/pb_explore/data/variants.tsv";
+    let variants = load_variants(variants_path)?;
+    println!("{:?}", variants[0]);
+    
+    let regions_path = "/lustre/scratch126/casm/team267ms/kg8/projects/pacbio/code/pb_explore/data/ht_regions.tsv";
+    let mut regions = load_regions(regions_path)?;
+    regions.sort_by(|a, b| a.name.cmp(&b.name));
+    println!("{:?}", regions[0]);
+
+    let my_region = get_region_with_name(&regions, "C").unwrap();
 
     let bam_path = "/lustre/scratch126/casm/team267ms/kg8/projects/pacbio/alignments/2169Tb.1.hifi_reads.aligned.bam";
     let mut bam = IndexedReader::from_path(bam_path).unwrap();
@@ -66,16 +125,18 @@ async fn main() -> Result<(), Error> {
 
     let chrnames = get_chrom_names(std::path::Path::new(bam_path)).unwrap();
     
-    //let f = bam.fetch(("21", 28669568, 28771175));
-    let f = bam.fetch(("1", 30237476, 33634687));
+    // let f = bam.fetch(("21", 28669568, 28771175));
+    // let f = bam.fetch(("1", 30237476, 33634687));
+    let f = fetch_bam_reads_from_region(&mut bam, &my_region)?;
     println!("{:?}", f);
 
     while let Some(result) = bam.read(&mut record) {
         // let record = result.unwrap();
         let qname = String::from_utf8(record.qname().to_vec()).unwrap();
-        if qname == "m84093_240411_112803_s2/102699030/ccs" {
+        if qname == "m84093_240411_112803_s2/111285790/ccs" {
             println!("record = {:?}", record);
             println!("record.qname = {:?}", qname);
+            println!("{}", String::from_utf8(record.seq().as_bytes().to_vec()).unwrap());
             break;
         }
     }
@@ -90,9 +151,16 @@ async fn main() -> Result<(), Error> {
     println!("overlap segment C = {:?}", overlap);
     let overlap = check_cigar_overlap(&record, 28669568, 28771175);
     println!("overlap segment D = {:?}", overlap);
-    let readpos = position_in_read(&record, 30238190).unwrap();
-    println!("readpos = {:?}", readpos);
-    println!("base = {:?}", record.seq()[readpos] as char);
-    println!("qual = {:?}", record.qual()[readpos]);
+
+    for refpos in 30243800..30243880 {
+        let ins_found = insertion_at_position(&record, refpos);
+        match ins_found {
+            Some(ins) => {
+                let seq = String::from_utf8(ins.seq.to_vec()).unwrap();
+                println!("ins_found = {:?}, {:?}", ins, seq);
+            },
+            None => {}
+        }
+    }
     Ok(())
 }
