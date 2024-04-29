@@ -6,6 +6,8 @@ use anyhow::Error;
 use rust_htslib::bam::{IndexedReader, Read, Reader, Record};
 use std::fs::File;
 use std::path::PathBuf;
+use std::fmt;
+use std::io::Write;
 
 mod cigar;
 mod regions;
@@ -138,41 +140,81 @@ fn read_overlaps_region(record: &Record, region: &Region) -> bool {
 fn main() -> Result<(), Error> {
     let variants_path = "/lustre/scratch126/casm/team267ms/kg8/projects/pacbio/code/pb_explore/data/variants.tsv";
     let variants = load_variants(variants_path)?;
-    println!("{:?}", variants[0]);
     
     let regions_path = "/lustre/scratch126/casm/team267ms/kg8/projects/pacbio/code/pb_explore/data/ht_regions.tsv";
     let mut regions = load_regions(regions_path)?;
     regions.sort_by(|a, b| a.name.cmp(&b.name));
-    println!("{:?}", regions[0]);
-
-    let my_region = get_region_with_name(&regions, "F").unwrap();
-
-    let my_variants = get_variants_from_region(&variants, &my_region);
-    println!("{:?}", my_variants[0]);
 
     let bam_path = "/lustre/scratch126/casm/team267ms/kg8/projects/pacbio/alignments/2169Tb.1.hifi_reads.aligned.bam";
     let mut bam = IndexedReader::from_path(bam_path).unwrap();
     let mut record = Record::new();
 
-    fetch_bam_reads_from_region(&mut bam, &my_region)?;
+    let mut results = std::collections::HashMap::new();
+    let mut limit = 0;
 
-    while let Some(result) = bam.read(&mut record) {
-        if record.qname() == b"m84093_240411_112803_s2/223871912/ccs" {
-            break;
-        }
-    }
     
-    println!("record = {:?}", record);
-    println!("record.qname = {:?}", String::from_utf8(record.qname().to_vec()));
-    println!("pos = {:?}", record.pos());
-    println!("is supplementary? = {:?}", record.is_supplementary());
+    'outer: for region in &regions {
+        eprintln!("region = {:?}", region);
+        fetch_bam_reads_from_region(&mut bam, region)?;
+        let my_variants = get_variants_from_region(&variants, region);
+        while let Some(result) = bam.read(&mut record) {
+            let key = String::from_utf8(record.qname().to_vec()).unwrap();
+            if !results.contains_key(&key) {
+                results.insert(key.clone(), vec![]);
+            }
+            if !read_overlaps_region(&record, region) {
+                continue;
+            }
+            for var in &my_variants {
+                if var.pos >= record.pos() && var.pos <= (record.pos() + record.seq_len() as i64) {
+                    let result = genotype_variant(&record, var)?;
+                    limit += 1;
+                    match result {
+                        GenotypeResult::OutOfRange => {},
+                        _ => results.get_mut(&key).unwrap().push((var.clone(), result)),
+                    }
+                }
+                if limit % 1000000 == 0 {
+                    eprintln!("limit = {}", limit);
+                }
+                //if limit >= 100000 { break 'outer; }
+            }
+        }
+        eprintln!("region {} done", region.name);
+    }
 
-    assert!(read_overlaps_region(&record, &my_region));
-    for var in &my_variants {
-        if var.pos >= record.pos() && var.pos <= (record.pos() + record.seq_len() as i64) {
-            let result = genotype_variant(&record, var);
-            println!("variant = {:?}", var);
-            println!("result = {:?}", result);
+    // Create an output directory
+    std::fs::create_dir_all("output")?;
+
+    // Write results
+    for k in results.keys() {
+        let f = k.replace("/", "!");
+        let outfile_name = format!("output/{}.tsv", f);
+        println!("Writing to {}", outfile_name);
+        let outfile = std::fs::File::create(outfile_name)?;
+        let mut writer = std::io::BufWriter::new(outfile);
+        
+        let header = format!("CHROM\tPOS\tREF\tALT\tIS_GERMLINE\tIS_INDEL\t{}", k);
+        writeln!(writer, "{}", header)?;
+        
+        let mut values = Vec::new();
+        for val in results.get(k).unwrap() {
+            values.push(val);
+        }
+        values.sort_by(|a, b| {
+            a.0.chrom
+                .cmp(&b.0.chrom)
+                .then_with(|| a.0.pos.cmp(&b.0.pos))
+        });
+        for (var, result) in values {
+            match result {
+                //GenotypeResult::OutOfRange => {},
+                _ => {
+                    let data = format!("{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        var.chrom, var.pos, var.ref_base, var.alt_base, var.is_germline, var.is_indel, result);
+                    writeln!(writer, "{}", data)?;
+                },
+            }
         }
     }
     Ok(())
@@ -184,7 +226,19 @@ enum GenotypeResult {
     Alternative(String),
     ThirdAllele(String),
     OutOfRange,
-    Deleted,
+    Ambiguous(String),
+}
+
+impl fmt::Display for GenotypeResult {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            GenotypeResult::Reference(base) => write!(f, "0"),
+            GenotypeResult::Alternative(base) => write!(f, "1"),
+            GenotypeResult::ThirdAllele(base) => write!(f, "x"),
+            GenotypeResult::OutOfRange => write!(f, "."),
+            GenotypeResult::Ambiguous(msg) => write!(f, "?"),
+        }
+    }
 }
 
 fn genotype_insertion(record: &Record, variant: &Variant) -> Result<GenotypeResult, Error> {
@@ -220,7 +274,7 @@ fn genotype_snp(record: &Record, variant: &Variant) -> Result<GenotypeResult, Er
                 Ok(GenotypeResult::ThirdAllele(base.to_string()))
             }
         },
-        ReadPosition::Deletion => Ok(GenotypeResult::Deleted),
+        ReadPosition::Deletion => Ok(GenotypeResult::Ambiguous("SNP is inside a deletion".to_owned())),
         ReadPosition::NotOverlapped => Ok(GenotypeResult::OutOfRange),
     }
 }
@@ -233,10 +287,10 @@ fn genotype_deletion(record: &Record, variant: &Variant) -> Result<GenotypeResul
         ReadPosition::Match(i) => {
             let base = record.seq()[i] as char;
             if base != variant.ref_base.chars().next().unwrap() {
-                return Err(Error::msg("Read is ambiguous at first position of deletion"));
+                return Ok(GenotypeResult::Ambiguous("Read is ambiguous at first position of deletion".to_owned()));
             }
         },
-        _ => return Err(Error::msg("First base of indel not found in read")),
+        _ => return Ok(GenotypeResult::Ambiguous("First base of indel not found in read".to_owned())),
     };
 
     // Then check the next n bases are deleted
@@ -248,7 +302,7 @@ fn genotype_deletion(record: &Record, variant: &Variant) -> Result<GenotypeResul
         match read_position {
             ReadPosition::Deletion => deletions_found += 1,
             ReadPosition::Match(_) => {},
-            _ => return Err(Error::msg("Read is ambiguous at deletion position")),
+            _ => return Ok(GenotypeResult::Ambiguous("Read contains a deletion of different size than the variant".to_owned())),
         }
     }
     if deletions_found == deletion_size {
