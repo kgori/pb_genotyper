@@ -1,6 +1,7 @@
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 #![allow(dead_code)]
+#![allow(unused_labels)]
 
 use anyhow::Error;
 use rust_htslib::bam::{IndexedReader, Read, Reader, Record};
@@ -8,6 +9,7 @@ use std::fs::File;
 use std::path::PathBuf;
 use std::fmt;
 use std::io::Write;
+use std::collections::{HashMap, HashSet};
 
 mod cigar;
 mod regions;
@@ -28,7 +30,7 @@ fn get_chrom_names(bamfile: &std::path::Path) -> Result<Vec<String>, Error> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Ord, PartialOrd)]
 struct Variant {
     chrom: String,
     pos: i64,
@@ -136,6 +138,35 @@ fn read_overlaps_region(record: &Record, region: &Region) -> bool {
     overlap
 }
 
+fn generate_variant_scores(variants: &Vec<Variant>) -> HashMap<Variant, i64> {
+    let mut scores = HashMap::new();
+    for (i, var) in variants.iter().enumerate() {
+        scores.insert(var.clone(), i as i64);
+    }
+    scores
+}
+
+fn generate_sort_keys(read_names: &Vec<String>, results: &HashMap<String, HashMap<Variant, GenotypeResult>>, variant_scores: &HashMap<Variant, i64>) -> HashMap<String, i64> {
+    let mut sorter = HashMap::new();
+    for read_name in read_names {
+        let entry = results.get(read_name);
+        match entry {
+            Some(entry) => {
+                if entry.is_empty() {
+                    sorter.insert(read_name.clone(), i64::MAX);
+                }
+                else {
+                    let score = entry.keys().map(|k| variant_scores.get(k).unwrap_or(&i64::MAX)).min().unwrap();
+                    sorter.insert(read_name.clone(), *score);
+                }
+            },
+            None => {
+                sorter.insert(read_name.clone(), i64::MAX);
+            },
+        }
+    }
+    sorter
+}
 
 fn main() -> Result<(), Error> {
     let variants_path = "/lustre/scratch126/casm/team267ms/kg8/projects/pacbio/code/pb_explore/data/variants.tsv";
@@ -149,18 +180,23 @@ fn main() -> Result<(), Error> {
     let mut bam = IndexedReader::from_path(bam_path).unwrap();
     let mut record = Record::new();
 
-    let mut results = std::collections::HashMap::new();
-    let mut limit = 0;
+    let mut results = HashMap::<String, HashMap<Variant, GenotypeResult>>::new();
 
+    let mut all_read_names: Vec<String> = Vec::new();
+    let mut seen_set: HashSet<String> = HashSet::new();
     
-    'outer: for region in &regions {
-        eprintln!("region = {:?}", region);
+    for region in &regions {
         fetch_bam_reads_from_region(&mut bam, region)?;
         let my_variants = get_variants_from_region(&variants, region);
         while let Some(result) = bam.read(&mut record) {
             let key = String::from_utf8(record.qname().to_vec()).unwrap();
+            
+            if !seen_set.contains(&key) {
+                all_read_names.push(key.clone());
+                seen_set.insert(key.clone());
+            }
             if !results.contains_key(&key) {
-                results.insert(key.clone(), vec![]);
+                results.insert(key.clone(), HashMap::new());
             }
             if !read_overlaps_region(&record, region) {
                 continue;
@@ -168,25 +204,60 @@ fn main() -> Result<(), Error> {
             for var in &my_variants {
                 if var.pos >= record.pos() && var.pos <= (record.pos() + record.seq_len() as i64) {
                     let result = genotype_variant(&record, var)?;
-                    limit += 1;
                     match result {
                         GenotypeResult::OutOfRange => {},
-                        _ => results.get_mut(&key).unwrap().push((var.clone(), result)),
+                        _ => {
+                            results.get_mut(&key).unwrap().insert(var.clone(), result);
+                        },
                     }
                 }
-                if limit % 1000000 == 0 {
-                    eprintln!("limit = {}", limit);
-                }
-                //if limit >= 100000 { break 'outer; }
             }
         }
         eprintln!("region {} done", region.name);
     }
 
+
+    // Sort the read_names
+    eprintln!("Sorting read names");
+    let variant_scores = generate_variant_scores(&variants);
+    let sorter = generate_sort_keys(&all_read_names, &results, &variant_scores);
+    all_read_names.sort_by(|a, b| sorter.get(a).cmp(&sorter.get(b)).then_with(|| a.cmp(b)));
+    
+
     // Create an output directory
     std::fs::create_dir_all("output")?;
 
+    
     // Write results
+    let outfile_name = "output/variants.tsv";
+    eprintln!("Writing to {}", outfile_name);
+    let outfile = std::fs::File::create(outfile_name)?;
+    let mut writer = std::io::BufWriter::new(outfile);
+    let header = format!("CHROM\tPOS\tREF\tALT\tIS_GERMLINE\tIS_INDEL\t{}", &all_read_names.join("\t"));
+    writeln!(writer, "{}", header)?;
+    for var in &variants {
+        let mut s = format!("{}\t{}\t{}\t{}\t{}\t{}\t", var.chrom, var.pos, var.ref_base, var.alt_base, var.is_germline, var.is_indel);
+        for read_name in &all_read_names {
+            let read_name_lookup = results.get(read_name);
+            match read_name_lookup {
+                Some(entry) => {
+                    if !entry.contains_key(var) {
+                        s.push_str(".\t");
+                    } else {
+                        s.push_str(&format!("{}", entry.get(var).unwrap()));
+                        s.push_str("\t");
+                    }
+                },
+                None => {
+                    eprintln!("No entry for read {} in results", read_name);
+                },
+            }
+        }
+
+        writeln!(writer, "{}", s.trim_end())?;
+    }
+    println!("Wrote to {}", outfile_name);
+
     for k in results.keys() {
         let f = k.replace("/", "!");
         let outfile_name = format!("output/{}.tsv", f);
@@ -220,7 +291,7 @@ fn main() -> Result<(), Error> {
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum GenotypeResult {
     Reference(String),
     Alternative(String),
