@@ -13,8 +13,11 @@ use std::collections::{HashMap, HashSet};
 
 mod cigar;
 mod regions;
+mod cli;
 
+use cli::ProgramOptions;
 use cigar::{check_cigar_overlap, get_read_position, ReadPosition, get_insertion_at_position};
+
 
 fn get_chrom_names(bamfile: &std::path::Path) -> Result<Vec<String>, Error> {
     let bam = Reader::from_path(bamfile)?;
@@ -54,7 +57,7 @@ impl Variant {
     }
 }
 
-fn open_tsv(file_path: &str) -> Result<csv::Reader<File>, Error> {
+fn open_tsv(file_path: &std::path::Path) -> Result<csv::Reader<File>, Error> {
     let file = File::open(file_path)?;
     let reader = csv::ReaderBuilder::new()
         .delimiter(b'\t')
@@ -64,7 +67,7 @@ fn open_tsv(file_path: &str) -> Result<csv::Reader<File>, Error> {
 }
 
 // Loads variants from a TSV file. Variant positions are 1-based.
-fn load_variants(file_path: &str) -> Result<Vec<Variant>, Error> {
+fn load_variants(file_path: &std::path::Path) -> Result<Vec<Variant>, Error> {
     let mut reader = open_tsv(file_path)?;
     reader.records().map(|record| {
         let record = record?;
@@ -95,7 +98,7 @@ struct Region {
 
 // Loads regions from a TSV file. Region positions are 1-based, inclusive ranges,
 // meaning that both the start and end positions are included in the region.
-fn load_regions(file_path: &str) -> Result<Vec<Region>, Error> {
+fn load_regions(file_path: &std::path::Path) -> Result<Vec<Region>, Error> {
     let mut reader = open_tsv(file_path)?;
     reader.records().map(|record| {
         let record = record?;
@@ -169,14 +172,16 @@ fn generate_sort_keys(read_names: &Vec<String>, results: &HashMap<String, HashMa
 }
 
 fn main() -> Result<(), Error> {
-    let variants_path = "/lustre/scratch126/casm/team267ms/kg8/projects/pacbio/code/pb_explore/data/variants.tsv";
-    let variants = load_variants(variants_path)?;
+    let options = cli::parse_cli();
     
-    let regions_path = "/lustre/scratch126/casm/team267ms/kg8/projects/pacbio/code/pb_explore/data/ht_regions.tsv";
-    let mut regions = load_regions(regions_path)?;
+    let variants_path = options.variants; //"/lustre/scratch126/casm/team267ms/kg8/projects/pacbio/code/pb_explore/data/variants.tsv";
+    let variants = load_variants(&variants_path)?;
+    
+    let regions_path = options.regions; //"/lustre/scratch126/casm/team267ms/kg8/projects/pacbio/code/pb_explore/data/ht_regions.tsv";
+    let mut regions = load_regions(&regions_path)?;
     regions.sort_by(|a, b| a.name.cmp(&b.name));
 
-    let bam_path = "/lustre/scratch126/casm/team267ms/kg8/projects/pacbio/alignments/2169Tb.1.hifi_reads.aligned.bam";
+    let bam_path = options.bamfile; //"/lustre/scratch126/casm/team267ms/kg8/projects/pacbio/alignments/2169Tb.1.hifi_reads.aligned.bam";
     let mut bam = IndexedReader::from_path(bam_path).unwrap();
     let mut record = Record::new();
 
@@ -225,43 +230,44 @@ fn main() -> Result<(), Error> {
     
 
     // Create an output directory
-    std::fs::create_dir_all("output")?;
-
+    std::fs::create_dir_all(&options.output)?;
+    eprintln!("Writing to {:?}", &options.output);
+    
     
     // Write results
-    let outfile_name = "output/variants.tsv";
-    eprintln!("Writing to {}", outfile_name);
-    let outfile = std::fs::File::create(outfile_name)?;
-    let mut writer = std::io::BufWriter::new(outfile);
-    let header = format!("CHROM\tPOS\tREF\tALT\tIS_GERMLINE\tIS_INDEL\t{}", &all_read_names.join("\t"));
-    writeln!(writer, "{}", header)?;
-    for var in &variants {
-        let mut s = format!("{}\t{}\t{}\t{}\t{}\t{}\t", var.chrom, var.pos, var.ref_base, var.alt_base, var.is_germline, var.is_indel);
-        for read_name in &all_read_names {
-            let read_name_lookup = results.get(read_name);
-            match read_name_lookup {
-                Some(entry) => {
-                    if !entry.contains_key(var) {
-                        s.push_str(".\t");
-                    } else {
-                        s.push_str(&format!("{}", entry.get(var).unwrap()));
-                        s.push_str("\t");
-                    }
-                },
-                None => {
-                    eprintln!("No entry for read {} in results", read_name);
-                },
-            }
-        }
+    // let outfile_name = "output/variants.tsv";
+    // eprintln!("Writing to {}", outfile_name);
+    // let outfile = std::fs::File::create(outfile_name)?;
+    // let mut writer = std::io::BufWriter::new(outfile);
+    // let header = format!("CHROM\tPOS\tREF\tALT\tIS_GERMLINE\tIS_INDEL\t{}", &all_read_names.join("\t"));
+    // writeln!(writer, "{}", header)?;
+    // for var in &variants {
+    //     let mut s = format!("{}\t{}\t{}\t{}\t{}\t{}\t", var.chrom, var.pos, var.ref_base, var.alt_base, var.is_germline, var.is_indel);
+    //     for read_name in &all_read_names {
+    //         let read_name_lookup = results.get(read_name);
+    //         match read_name_lookup {
+    //             Some(entry) => {
+    //                 if !entry.contains_key(var) {
+    //                     s.push_str(".\t");
+    //                 } else {
+    //                     s.push_str(&format!("{}", entry.get(var).unwrap()));
+    //                     s.push_str("\t");
+    //                 }
+    //             },
+    //             None => {
+    //                 eprintln!("No entry for read {} in results", read_name);
+    //             },
+    //         }
+    //     }
 
-        writeln!(writer, "{}", s.trim_end())?;
-    }
-    println!("Wrote to {}", outfile_name);
+    //     writeln!(writer, "{}", s.trim_end())?;
+    // }
+    // println!("Wrote to {}", outfile_name);
 
     for k in results.keys() {
         let f = k.replace("/", "!");
-        let outfile_name = format!("output/{}.tsv", f);
-        println!("Writing to {}", outfile_name);
+        let outfile_name = options.output.join(format!("{}.tsv", f));
+        println!("Writing to {:?}", outfile_name);
         let outfile = std::fs::File::create(outfile_name)?;
         let mut writer = std::io::BufWriter::new(outfile);
         
@@ -388,6 +394,12 @@ fn genotype_deletion(record: &Record, variant: &Variant) -> Result<GenotypeResul
 fn genotype_variant(record: &Record, variant: &Variant) -> Result<GenotypeResult, Error> {
     if variant.pos <= record.pos() || variant.pos > (record.pos() + record.seq_len() as i64) {
         return Ok(GenotypeResult::OutOfRange);
+    }
+
+    let read_position = get_read_position(record, (variant.pos - 1) as i64);
+    match read_position {
+        ReadPosition::NotOverlapped => return Ok(GenotypeResult::OutOfRange),
+        _ => {},
     }
     
     if variant.is_indel {
