@@ -1,3 +1,7 @@
 /target
+/data
+/debug
+/outputs
+/.cargo
 *.pdf
 *.tsv
