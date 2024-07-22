@@ -28,3 +28,9 @@ where `VARIANTS` is a TSV file containing a list of variant positions in the for
 regions to load from the BAM file in the format `<CHROM> <START> <END> <ID>`, `BAMFILE`
 is a BAM file containing the aligned reads to genotype, and `OUTPUT` is the output folder
 to write the genotyped reads to.
+
+
+### Example data
+There are some example input files in `data/variants.tsv` and `data/ht_regions.tsv`.
+The read data is too large to be included in the repository, but is available
+from ENA \[submission in prep.\].
